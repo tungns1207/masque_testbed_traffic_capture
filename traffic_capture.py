@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 import argparse
+import asyncio
 import multiprocessing
 import nest_asyncio
 import os
@@ -45,6 +46,8 @@ def open_website(url):
     options.add_argument("--headless") 
     options.add_argument("--no-sandbox") 
     options.add_argument("--disable-dev-shm-usage") 
+    options.add_argument("--incognito") 
+    options.add_argument("--disk-cache-size=0") 
     
     # Configure SOCKS5 Proxy for Chrome
     options.add_argument(f"--proxy-server=socks5://{PROXY_HOST}:{PROXY_PORT}")
@@ -148,9 +151,14 @@ def packet_capture(url, index, pcap_base_dir):
     return trace_file, dir_name
 
 def contains_quic(trace_file):
+    cap = None
     try:
-        trace_file_cap = pyshark.FileCapture(trace_file, display_filter="quic")
-        for packet in trace_file_cap:
+        # Reset event loop before pyshark usage
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        cap = pyshark.FileCapture(trace_file, display_filter="quic")
+        for packet in cap:
             for layer in packet:
                 if layer.layer_name == 'quic':
                     if packet.udp.srcport == "443" or packet.udp.dstport == "443":
@@ -159,10 +167,23 @@ def contains_quic(trace_file):
     except Exception as e:
         print(f"Pyshark read error: {e}")
         return False
+    finally:
+        if cap is not None:
+            try:
+                cap.close()
+            except Exception:
+                pass
+        # Dọn rác tshark process còn sót lại
+        subprocess.run(["pkill", "-9", "tshark"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def parse_pcap(trace_file_path):
     features = list()
+    trace_file = None
     try:
+        # Reset event loop for each parse call to avoid nest_asyncio/pyshark conflict
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         # Get host IP. Docker might have multiple IPs (space-separated), extract the first one
         host_ip = os.popen("hostname -i").read().strip().split(" ")[0]
         
@@ -210,11 +231,15 @@ def parse_pcap(trace_file_path):
     except Exception as e:
         import traceback
         print(f"-----Error parsing PCAP: {e}")
-        traceback.print_exc() # Print detailed traceback if it still crashes
+        traceback.print_exc()
     finally:
-        # Safely close the file to free memory
-        if 'trace_file' in locals():
-            trace_file.close()
+        if trace_file is not None:
+            try:
+                trace_file.close()
+            except Exception:
+                pass  # Bỏ qua TSharkCrashException khi close
+        # Dọn rác tshark process còn sót lại
+        subprocess.run(["pkill", "-9", "tshark"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return features
 
 def generate_traces(target_websites_dir):
