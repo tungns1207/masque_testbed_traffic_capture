@@ -95,23 +95,29 @@ def _run_proxy():
     # os.execv thay thế process hiện tại — không tạo child process
     os.execv("./masque-plus", ["./masque-plus", "--endpoint", PROXY_ENDPOINT])
 
-def start_proxy():
-    print("-----Starting Masque Proxy")
-    os.system("pkill -9 masque-plus 2>/dev/null")
-    time.sleep(1)
-    proc = multiprocessing.Process(target=_run_proxy)
-    proc.start()
-    time.sleep(3)
-    return proc
-
 def stop_proxy(proc):
     print("-----Stopping Masque Proxy")
+    # Kill process đang giữ port 1080
+    os.system("fuser -k 1080/tcp 2>/dev/null")
+    os.system("pkill -9 usque 2>/dev/null")
     if proc is not None and proc.is_alive():
         proc.terminate()
         proc.join(timeout=3)
         if proc.is_alive():
             proc.kill()
             proc.join(timeout=2)
+    time.sleep(1)
+
+def start_proxy():
+    print("-----Starting Masque Proxy")
+    # Dọn sạch trước khi start
+    os.system("fuser -k 1080/tcp 2>/dev/null")
+    os.system("pkill -9 usque 2>/dev/null")
+    time.sleep(1)
+    proc = multiprocessing.Process(target=_run_proxy)
+    proc.start()
+    time.sleep(3)
+    return proc
 
 
 # ─── PACKET CAPTURE ───────────────────────────────────────────────────────────
