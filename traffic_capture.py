@@ -9,11 +9,12 @@ import subprocess
 import time
 import signal
 import resource
+import gc
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
 nest_asyncio.apply()
-multiprocessing.set_start_method('spawn', force=True)  # FIX 2: tránh fork copy asyncio state
+multiprocessing.set_start_method('spawn', force=True)
 
 # --- CONFIGURATION ---
 INTERFACE = "eth0"
@@ -40,104 +41,150 @@ def open_website(url):
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--incognito")
     options.add_argument("--disk-cache-size=0")
     options.add_argument(f"--proxy-server=socks5://{PROXY_HOST}:{PROXY_PORT}")
     options.add_argument("--ignore-certificate-errors")
+    
+    options.page_load_strategy = 'none'
+    
+    driver = None
     try:
         driver = webdriver.Chrome(options=options)
-    except Exception as e:
-        print(f"-----Chrome launch failed: {e}")
-        return
-    try:
         driver.set_page_load_timeout(10)
         driver.get(url)
         print(f"-----Loaded: {driver.title}")
-        time.sleep(5)
+        time.sleep(10)
     except Exception as e:
         print(f"-----Browser Error: {e}")
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
 
 
 # ─── TCPDUMP ──────────────────────────────────────────────────────────────────
 
-def _run_tcpdump(trace_file):
-    # os.execv thay thế process hiện tại — không tạo child process
-    os.execv("/usr/bin/tcpdump", [
-        "tcpdump", "-i", INTERFACE,
-        "-w", trace_file,
-        "port", "80", "or", "port", "443", "or", "port", "853"
-    ])
-
 def start_tcpdump(trace_file):
     print("-----Running tcpdump")
-    proc = multiprocessing.Process(target=_run_tcpdump, args=(trace_file,))
-    proc.start()
-    return proc
+    return subprocess.Popen([
+        "/usr/bin/tcpdump", "-i", INTERFACE,
+        "-w", trace_file,
+        "port", "80", "or", "port", "443", "or", "port", "853"
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def stop_tcpdump(proc):
     print("-----Stopping tcpdump")
-    if proc is not None and proc.is_alive():
+    if proc:
         proc.terminate()
-        proc.join(timeout=3)
-        if proc.is_alive():
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
             proc.kill()
-            proc.join(timeout=2)
 
 
 # ─── MASQUE PROXY ─────────────────────────────────────────────────────────────
 
-def _run_proxy():
-    # os.execv thay thế process hiện tại — không tạo child process
-    os.execv("./masque-plus", ["./masque-plus", "--endpoint", PROXY_ENDPOINT])
+def start_proxy():
+    print("-----Starting Masque Proxy")
+    os.system("fuser -k 1080/tcp 2>/dev/null")
+    os.system("pkill -9 -f masque-plus 2>/dev/null")
+    os.system("pkill -9 -f usque 2>/dev/null")
+    time.sleep(1)
+    
+    proc = subprocess.Popen(
+        ["./masque-plus", "--endpoint", PROXY_ENDPOINT],
+        stdout=subprocess.DEVNULL, 
+        stderr=subprocess.DEVNULL,
+        preexec_fn=os.setsid
+    )
+    time.sleep(3)
+    return proc
 
 def stop_proxy(proc):
     print("-----Stopping Masque Proxy")
-    # Kill process đang giữ port 1080
+    if proc:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+
     os.system("fuser -k 1080/tcp 2>/dev/null")
-    os.system("pkill -9 usque 2>/dev/null")
-    if proc is not None and proc.is_alive():
-        proc.terminate()
-        proc.join(timeout=3)
-        if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=2)
+    os.system("pkill -9 -f masque-plus 2>/dev/null")
+    os.system("pkill -9 -f usque 2>/dev/null")
     time.sleep(1)
 
-def start_proxy():
-    print("-----Starting Masque Proxy")
-    # Dọn sạch trước khi start
-    os.system("fuser -k 1080/tcp 2>/dev/null")
-    os.system("pkill -9 usque 2>/dev/null")
-    time.sleep(1)
-    proc = multiprocessing.Process(target=_run_proxy)
-    proc.start()
-    time.sleep(3)
-    return proc
+
+# ─── PYSHARK PROCESSING ───────────────────────────────────────────────────────
+
+def contains_quic(trace_file):
+    try:
+        # Dùng 'with' để Pyshark tự đóng luồng an toàn, không sinh lỗi Event Loop
+        with pyshark.FileCapture(trace_file, display_filter="quic") as cap:
+            for packet in cap:
+                if hasattr(packet, 'udp') and (packet.udp.srcport == "443" or packet.udp.dstport == "443"):
+                    return True
+        return False
+    except Exception as e:
+        print(f"Pyshark read error: {e}")
+        return False
+    finally:
+        os.system("pkill -9 -f tshark 2>/dev/null")
+        time.sleep(0.5)
+
+def parse_pcap(trace_file_path):
+    features = []
+    try:
+        host_ip = os.popen("hostname -i").read().strip().split()[0]
+        # Dùng 'with' quản lý vòng đời Capture
+        with pyshark.FileCapture(trace_file_path, keep_packets=False) as cap:
+            for packet in cap:
+                try:
+                    if not hasattr(packet, 'ip') or not hasattr(packet, 'transport_layer') or packet.transport_layer is None:
+                        continue
+                    
+                    t_layer = packet.transport_layer
+                    src_ip, dst_ip = str(packet.ip.src_host), str(packet.ip.dst_host)
+                    
+                    features.append({
+                        "protocol": "1" if t_layer in ("QUIC", "UDP") else "0",
+                        "length": str(packet.length),
+                        "relative_time": f"{float(getattr(packet.frame_info, 'time_delta')):.9f}",
+                        "direction": "1" if src_ip == host_ip else "0",
+                        "src_ip": src_ip,
+                        "src_port": str(packet[t_layer].srcport),
+                        "dst_ip": dst_ip,
+                        "dst_port": str(packet[t_layer].dstport)
+                    })
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"-----Error parsing PCAP: {e}")
+    finally:
+        os.system("pkill -9 -f tshark 2>/dev/null")
+        time.sleep(0.5)
+        return features
+
+
 # ─── PACKET CAPTURE ───────────────────────────────────────────────────────────
 
 def packet_capture(url, index, pcap_base_dir):
-    tcp_proc = None
-    proxy_proc = None
-    web_proc = None
-    trace_file = ""
-
+    tcp_proc = proxy_proc = web_proc = None
     domain = url.split("//")[1]
-    dir_name = "_".join(domain.split("."))
-    dir_name = "_".join(dir_name.split("/"))[:-1]
-
+    dir_name = "_".join(domain.split(".")).replace("/", "_").rstrip("_")
+    
     website_pcap_dir = os.path.join(pcap_base_dir, dir_name)
     os.makedirs(website_pcap_dir, exist_ok=True)
+    trace_file = os.path.join(website_pcap_dir, f"{index + 1}_{dir_name}.pcap")
 
     try:
-        trace_file = os.path.join(website_pcap_dir, f"{index + 1}_{dir_name}.pcap")
-        subprocess.run(["touch", trace_file])
-        subprocess.run(["chmod", "o=rw", trace_file])
-
         tcp_proc = start_tcpdump(trace_file)
         time.sleep(1)
 
@@ -146,162 +193,92 @@ def packet_capture(url, index, pcap_base_dir):
         web_proc = multiprocessing.Process(target=open_website, args=(url,))
         web_proc.start()
         web_proc.join(timeout=20)
+        
         if web_proc.is_alive():
             print("-----Chrome timeout, terminating...")
             web_proc.terminate()
             web_proc.join(timeout=5)
-            if web_proc.is_alive():
-                web_proc.kill()
-                web_proc.join(timeout=2)
+            if web_proc.is_alive(): web_proc.kill()
 
     except Exception as e:
         print(f"Error during capture: {e}")
-        if trace_file and os.path.exists(trace_file):
-            os.remove(trace_file)
+        if os.path.exists(trace_file): os.remove(trace_file)
     finally:
-        if web_proc is not None and web_proc.is_alive():
+        if web_proc and web_proc.is_alive():
             web_proc.terminate()
             web_proc.join(timeout=3)
+        
         stop_proxy(proxy_proc)
         stop_tcpdump(tcp_proc)
-        os.system("pkill -9 chromedriver 2>/dev/null")
-        os.system("pkill -9 chrome 2>/dev/null")
+        
+        os.system("pkill -9 -f chromedriver 2>/dev/null")
+        os.system("pkill -9 -f chrome 2>/dev/null")
         time.sleep(1)
 
     return trace_file, dir_name
 
 
-# ─── PYSHARK ──────────────────────────────────────────────────────────────────
-
-def contains_quic(trace_file):
-    cap = None
-    try:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        cap = pyshark.FileCapture(trace_file, display_filter="quic")
-        for packet in cap:
-            for layer in packet:
-                if layer.layer_name == 'quic':
-                    if hasattr(packet, 'udp') and (packet.udp.srcport == "443" or packet.udp.dstport == "443"):
-                        return True
-        return False
-    except Exception as e:
-        print(f"Pyshark read error: {e}")
-        return False
-    finally:
-        if cap is not None:
-            try:
-                cap.close()
-            except Exception:
-                pass
-        os.system("pkill -9 tshark 2>/dev/null")
-        time.sleep(0.5)
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
-
-def parse_pcap(trace_file_path):
-    features = list()
-    trace_file = None
-    try:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        host_ip = os.popen("hostname -i").read().strip().split(" ")[0]
-        trace_file = pyshark.FileCapture(trace_file_path, keep_packets=False)
-
-        for packet in trace_file:
-            try:
-                feature = dict()
-                if hasattr(packet, 'ip'):
-                    src_ip = str(packet.ip.src_host)
-                    dst_ip = str(packet.ip.dst_host)
-                else:
-                    continue
-                if not hasattr(packet, 'transport_layer') or packet.transport_layer is None:
-                    continue
-                transport_layer = packet.transport_layer
-                feature["protocol"] = "1" if transport_layer in ("QUIC", "UDP") else "0"
-                feature["length"] = str(packet.length)
-                feature["relative_time"] = str("{:.9f}".format(float(getattr(packet.frame_info, "time_delta"))))
-                feature["direction"] = "1" if src_ip == host_ip else "0"
-                feature["src_ip"] = src_ip
-                feature["src_port"] = str(packet[transport_layer].srcport)
-                feature["dst_ip"] = dst_ip
-                feature["dst_port"] = str(packet[transport_layer].dstport)
-                features.append(feature)
-            except Exception:
-                continue
-
-    except Exception as e:
-        import traceback
-        print(f"-----Error parsing PCAP: {e}")
-        traceback.print_exc()
-    finally:
-        if trace_file is not None:
-            try:
-                trace_file.close()
-            except Exception:
-                pass
-        os.system("pkill -9 tshark 2>/dev/null")
-        time.sleep(0.5)
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        return features
-
-
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
-def generate_traces(target_websites_dir):
+def generate_traces(target_websites_file):
     pcap_dir = os.path.join(args.trace_file_dir, "pcap")
     csv_dir = os.path.join(args.trace_file_dir, "csv")
     os.makedirs(pcap_dir, exist_ok=True)
     os.makedirs(csv_dir, exist_ok=True)
 
-    for i in range(0, args.access_count):
-        with open(target_websites_dir) as target_websites:
-            websites_count = 0
-            gap_count = 0
-            for url in target_websites:
-                gap_count += 1
-                if gap_count <= args.gap_count:
-                    continue
-                url = url.rstrip("\n")
-                print(f"\n[+] Processing {url} (Attempt {i+1}/{args.access_count})")
+    # Đọc và phân loại danh sách URL đúng 1 lần duy nhất
+    if not os.path.exists(target_websites_file):
+        print(f"File {target_websites_file} không tồn tại!")
+        return
 
-                trace_file_path, dir_name = packet_capture(url, i, pcap_dir)
+    with open(target_websites_file, 'r') as f:
+        all_urls = [line.strip() for line in f if line.strip()]
+    
+    # Cắt danh sách (slice) theo cấu hình gap_count và websites_count
+    target_urls = all_urls[args.gap_count : args.gap_count + args.websites_count]
 
-                if not os.path.exists(trace_file_path):
-                    continue
+    for i in range(args.access_count):
+        for url in target_urls:
+            print(f"\n[+] Processing {url} (Attempt {i+1}/{args.access_count})")
 
-                has_quic = False
-                if args.filter:
-                    has_quic = contains_quic(trace_file_path)
+            trace_file_path, dir_name = packet_capture(url, i, pcap_dir)
+            if not os.path.exists(trace_file_path):
+                continue
 
+            # Phân tích Pyshark
+            has_quic = contains_quic(trace_file_path) if args.filter else True
+            
+            if has_quic:
                 features = parse_pcap(trace_file_path)
-
-                if len(features) != 0:
-                    if not args.filter or has_quic:
-                        website_csv_dir = os.path.join(csv_dir, dir_name)
-                        os.makedirs(website_csv_dir, exist_ok=True)
-
-                        dataset_file_path = os.path.join(website_csv_dir, f"{i + 1}_{dir_name}.csv")
-                        print(f"--> Saved PCAP to: {trace_file_path}")
-                        print(f"--> Saved CSV to: {dataset_file_path}")
-
-                        with open(dataset_file_path, mode='w') as dataset_file:
-                            dataset_file.write(";".join(features[0].keys()) + '\n')
-                            for feature in features:
-                                dataset_file.write(";".join(feature.values()) + '\n')
-
-                websites_count += 1
-                if websites_count == args.websites_count:
-                    break
+                if features:
+                    website_csv_dir = os.path.join(csv_dir, dir_name)
+                    os.makedirs(website_csv_dir, exist_ok=True)
+                    dataset_file_path = os.path.join(website_csv_dir, f"{i + 1}_{dir_name}.csv")
+                    
+                    with open(dataset_file_path, mode='w') as df:
+                        df.write(";".join(features[0].keys()) + '\n')
+                        for feature in features:
+                            df.write(";".join(feature.values()) + '\n')
+                    
+                    print(f"--> Saved PCAP to: {trace_file_path}")
+                    print(f"--> Saved CSV to: {dataset_file_path}")
+            
+            # Xóa rác RAM lập tức
+            gc.collect()
 
 
 if __name__ == '__main__':
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (65536, hard))
-    soft_proc, hard_proc = resource.getrlimit(resource.RLIMIT_NPROC)
-    resource.setrlimit(resource.RLIMIT_NPROC, (65536, hard_proc))
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (65536, hard))
+        _, hard_proc = resource.getrlimit(resource.RLIMIT_NPROC)
+        resource.setrlimit(resource.RLIMIT_NPROC, (65536, hard_proc))
+    except Exception as e:
+        pass
 
     start_time = time.time()
     generate_traces(args.target_websites)
-    end_time = time.time()
-    print(f"\nElapsed time: {end_time - start_time} seconds")
+    print(f"\nElapsed time: {time.time() - start_time:.2f} seconds")
+    
+    # Trả lại quyền file cho host
     subprocess.run(["chmod", "-R", "777", args.trace_file_dir], stderr=subprocess.DEVNULL)
