@@ -1,8 +1,8 @@
 import os
 
 # 🔧 Chỉnh sửa đường dẫn tại đây
-PARENT_FOLDER = "/duong/dan/toi/folder_cha"
-OUTPUT_FILE = "report.txt"
+PARENT_FOLDER = "/home/tungns/Documents/MASQUE/MASQUE_traffic_fingerprint/csv_101_105"
+OUTPUT_FILE = "report_101_105.txt"
 
 
 def count_lines_in_csv(file_path):
